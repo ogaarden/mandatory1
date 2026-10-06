@@ -7,9 +7,6 @@ from poisson import Poisson
 
 x, y = sp.symbols("x,y")
 
-# Below we create a solver that reuses some of the implementation from
-# the 1D solver in poisson.py.
-
 
 class Poisson2D:
     r"""Solve Poisson's equation in 2D::
@@ -23,120 +20,66 @@ class Poisson2D:
         self.p = Poisson(L)  # we can reuse some of the code from the 1D case
 
     def create_mesh(self, N: int) -> tuple[np.ndarray, np.ndarray]:
-        """Return a 2D Cartesian mesh
-
-        Parameters
-        ----------
-        N : int
-            The number of uniform intervals in both x and y directions
-        Returns
-        -------
-        xij : 2D array
-            The x-coordinates of the mesh
-        yij : 2D array
-            The y-coordinates of the mesh
-        """
+        """Return a 2D Cartesian mesh"""
         xi = self.p.create_mesh(N)
         xij, yij = np.meshgrid(xi, xi, indexing="ij", sparse=True)
         return xij, yij
 
+    def D2(self, N: int) -> sparse.lil_matrix:
+        """Return 1D second derivative matrix (central differences)"""
+        h = self.p.L / N
+        D = sparse.diags([1.0, -2.0, 1.0], [-1, 0, 1], (N + 1, N + 1), "lil")
+        # Second order one-sided stencils on the boundary rows
+        D[0, :4] = 2, -5, 4, -1
+        D[-1, -4:] = -1, 4, -5, 2
+        return D / h**2
+
     def laplace(self, N: int) -> sparse.lil_matrix:
-        """Return a vectorized Laplace operator
+        """Return a vectorized Laplace operator"""
+        D2 = self.D2(N)
+        I = sparse.eye(N + 1)
+        return (sparse.kron(D2, I) + sparse.kron(I, D2)).tolil()
 
-        Parameters
-        ----------
-        N : int
-            The number of uniform intervals in both x and y directions
-
-        Returns
-        -------
-        A : scipy sparse LIL matrix
-            The vectorized Laplace operator
-        """
-        raise NotImplementedError("The laplace method is not implemented yet.")
+    def get_boundary_indices(self, N: int) -> np.ndarray:
+        """Return indices of vectorized matrix that belongs to the boundary"""
+        B = np.ones((N + 1, N + 1), dtype=bool)
+        B[1:-1, 1:-1] = False
+        return np.where(B.ravel())[0]
 
     def assemble(
         self, N: int, f: sp.Expr, ue: sp.Expr
     ) -> tuple[sparse.csr_matrix, np.ndarray]:
-        """Return assembled coefficient matrix A and right hand side vector b
+        """Return assembled coefficient matrix A and right hand side vector b"""
+        A = self.laplace(N)
+        bnds = self.get_boundary_indices(N)
+        # Replace boundary rows with identity rows (Dirichlet)
+        for i in bnds:
+            A.rows[i] = [i]
+            A.data[i] = [1.0]
+        A = A.tocsr()
 
-        Parameters
-        ----------
-        Nx : int
-            The number of uniform intervals in both x and y directions
-        f : Sympy expression
-            The right hand side as a Sympy expression in x and y
-        ue : Sympy expression
-            The exact solution as a Sympy expression in x and y
-
-        Returns
-        -------
-        A : scipy sparse CSR matrix
-            Coefficient matrix
-        b : 1D array
-            Right hand side vector
-
-        Note
-        ----
-        Compute the Kronecker product of the 1D Laplace operator with itself
-        to create the 2D Laplace operator. Then, assemble the right-hand side
-        vector b by evaluating the function f at the mesh points and applying
-        Dirichlet boundary conditions using the exact solution ue.
-
-        """
-        raise NotImplementedError("The assemble method is not implemented yet.")
+        xij, yij = self.create_mesh(N)
+        b = self.meshfunction(f, xij, yij)
+        uij = self.meshfunction(ue, xij, yij)
+        b.ravel()[bnds] = uij.ravel()[bnds]
+        return A, b
 
     def meshfunction(self, u: sp.Expr, xij: np.ndarray, yij: np.ndarray) -> np.ndarray:
-        """Return Sympy function as mesh function
-
-        Parameters
-        ----------
-        u : Sympy function
-
-        Returns
-        -------
-        array - The input function as a mesh function
-        """
-        raise NotImplementedError("The meshfunction method is not implemented yet.")
-
-    def get_boundary_indices(self, N: int) -> np.ndarray:
-        """Return indices of vectorized matrix that belongs to the boundary"""
-        raise NotImplementedError(
-            "The get_boundary_indices method is not implemented yet."
-        )
+        """Return Sympy function as mesh function"""
+        shape = (xij.shape[0], yij.shape[1])
+        values = sp.lambdify((x, y), u, "numpy")(xij, yij)
+        return np.array(np.broadcast_to(values, shape), dtype=float)
 
     def l2_error(self, u: np.ndarray, ue: sp.Expr) -> float:
-        """Return l2-error
-
-        Parameters
-        ----------
-        u : array
-            The numerical solution (mesh function)
-        ue : Sympy expression
-            The exact solution
-
-        Returns
-        -------
-        float - The l2-error
-
-        """
-        raise NotImplementedError("The l2_error method is not implemented yet.")
+        """Return l2-error"""
+        N = u.shape[0] - 1
+        h = self.p.L / N
+        xij, yij = self.create_mesh(N)
+        uej = self.meshfunction(ue, xij, yij)
+        return np.sqrt(h * h * np.sum((u - uej) ** 2))
 
     def __call__(self, N: int, ue: sp.Expr) -> np.ndarray:
-        """Solve Poisson's equation with a given manufactured solution
-
-        Parameters
-        ----------
-        Nx : int
-            The number of uniform intervals in both x and y directions
-        ue : Sympy expression
-            The exact solution
-
-        Returns
-        -------
-        The solution as a Numpy array
-
-        """
+        """Solve Poisson's equation with a given manufactured solution"""
         A, b = self.assemble(N, sp.diff(ue, x, 2) + sp.diff(ue, y, 2), ue)
         return sparse_linalg.spsolve(A, b.ravel()).reshape((N + 1, N + 1))
 
@@ -152,20 +95,31 @@ class Poisson2D:
         r = [np.log(E[i - 1] / E[i]) / np.log(h[i - 1] / h[i]) for i in range(1, m, 1)]
         return r, np.array(E), np.array(h)
 
+    @staticmethod
+    def _lagrange_weights(nodes: np.ndarray, xp: float) -> np.ndarray:
+        """Lagrange basis functions for the given nodes evaluated at xp"""
+        w = np.ones(len(nodes))
+        for j in range(len(nodes)):
+            for k in range(len(nodes)):
+                if k != j:
+                    w[j] *= (xp - nodes[k]) / (nodes[j] - nodes[k])
+        return w
+
     def eval(self, U: np.ndarray, x: float, y: float) -> float:
-        """Return u(x, y)
+        """Return u(x, y) using cubic Lagrange interpolation on a 4x4 stencil"""
+        N = U.shape[0] - 1
+        h = self.p.L / N
+        xi = self.p.create_mesh(N)
 
-        Parameters
-        ----------
-        x, y : numbers
-            The coordinates for evaluation
+        def stencil(p):
+            i = int(np.floor(p / h))
+            i0 = min(max(i - 1, 0), N - 3)
+            return np.arange(i0, i0 + 4)
 
-        Returns
-        -------
-        The value of u(x, y)
-
-        """
-        raise NotImplementedError("The eval method is not implemented yet.")
+        ix, iy = stencil(x), stencil(y)
+        wx = self._lagrange_weights(xi[ix], x)
+        wy = self._lagrange_weights(xi[iy], y)
+        return float(wx @ U[np.ix_(ix, iy)] @ wy)
 
 
 def test_convergence_poisson2d():
